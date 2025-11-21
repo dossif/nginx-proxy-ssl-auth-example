@@ -1,0 +1,36 @@
+#
+# nginx webserver and nginx proxy
+#
+name: nginx-webserver-proxy
+services:
+  webserver:
+    container_name: nginx_webserver
+    image: nginx
+    volumes:
+      - ./nginx.index.html:/var/www/html/index.html
+      - ./nginx.webserver.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx.webserver.crt:/etc/nginx/nginx.webserver.crt
+      - ./nginx.webserver.key:/etc/nginx/nginx.webserver.key
+
+      - ./auth.ca.crt:/etc/nginx/auth.ca.crt
+      - ./auth.ca.key:/etc/nginx/auth.ca.key
+    ports:
+      - 8443:443
+    restart: unless-stopped
+  proxy:
+    container_name: nginx_proxy
+    image: nginx
+    volumes:
+      - ./nginx.proxy.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx.proxy.crt:/etc/nginx/nginx.proxy.crt
+      - ./nginx.proxy.key:/etc/nginx/nginx.proxy.key
+
+      - ./auth.client.crt:/etc/nginx/auth.client.crt
+      - ./auth.client.key:/etc/nginx/auth.client.key
+    ports:
+      - 9443:443
+    restart: unless-stopped
+    depends_on:
+      - webserver
+
+# ned
