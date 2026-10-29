@@ -1,105 +1,85 @@
 # Nginx Proxy SSL Auth Example (mTLS)
 
-Демо взаимной TLS-аутентификации (mTLS) на двух контейнерах nginx:
+Демонстрация взаимной TLS-аутентификации (mTLS) на двух контейнерах nginx. Сервис webserver обслуживает
+только тех клиентов, которые предъявили сертификат, выпущенный доверенным удостоверяющим центром (CA).
+Сервис proxy предъявляет такой сертификат при обращении к webserver. Таким образом, прямой доступ к webserver
+без сертификата невозможен, а доступ через proxy разрешён.
 
-- **webserver** отдаёт страницу только тем клиентам, которые предъявили сертификат, подписанный доверенным CA;
-- **proxy** держит такой клиентский сертификат и предъявляет его webserver'у при каждом запросе, а сам
-  проверяет сертификат webserver.
+## Принцип mTLS
 
-В итоге напрямую к webserver без сертификата не пустят, а через proxy пустят.
+В классическом TLS сертификат предъявляет только сервер. В mutual TLS аутентификация двусторонняя: в ходе
+рукопожатия сервер запрашивает сертификат клиента и проверяет, что он подписан доверенным CA. При неуспешной
+проверке соединение отклоняется до начала обмена на уровне HTTP. Владение сертификатом клиент подтверждает
+подписью закрытым ключом, поэтому сертификат без соответствующего ключа непригоден для аутентификации.
 
-## Что такое mTLS
+## Схема проверок
 
-В обычном TLS (как на любом HTTPS-сайте) сертификат предъявляет только **сервер**. Клиент проверяет, что
-сервер тот, за кого себя выдаёт, но сам остаётся анонимным для TLS-слоя: кто он, сервер узнаёт уже на уровне
-приложения (логин/пароль, токен и т.п.).
+| Проверяющая сторона | Проверяемый сертификат      | Доверенный CA      | Результат отказа  |
+|---------------------|-----------------------------|--------------------|-------------------|
+| webserver           | proxy (`mtls-proxy.crt`)    | `mtls-ca.crt`      | `400 Bad Request` |
+| proxy               | webserver (`webserver.crt`) | `webserver-ca.crt` | `502 Bad Gateway` |
+| curl                | proxy (`proxy.crt`)         | `proxy-ca.crt`     | `curl: (60)`      |
 
-В **mutual TLS** сертификат предъявляют **обе стороны**. Сервер во время рукопожатия запрашивает у клиента
-сертификат и проверяет, что тот подписан доверенным центром сертификации (CA). Не прошёл проверку — соединение
-отклоняется ещё до того, как HTTP-запрос дошёл до приложения.
+Доверие устанавливается к CA, а не к отдельному сертификату. Это позволяет перевыпускать сертификаты и
+использовать несколько экземпляров webserver без изменения конфигурации proxy: принимается любой сертификат,
+подписанный `webserver-ca`. Каждой роли назначен отдельный CA, что исключает смешение ролей: например,
+сертификат одного webserver не может быть использован как клиентский для другого.
 
-Чтобы клиент мог предъявить сертификат, ему мало одного сертификата: нужен ещё **закрытый ключ** к нему.
-Во время рукопожатия клиент подписывает этим ключом данные сессии и тем доказывает, что ключ у него есть.
-Поэтому украденный сертификат без ключа бесполезен.
+> В демонстрации `proxy-ca` моделирует публичный удостоверяющий центр. В промышленной эксплуатации
+> сертификат proxy следует получать у публичного УЦ, например [Let's Encrypt](https://letsencrypt.org/);
+> в этом случае параметр `--cacert` не требуется. `mtls-ca` и `webserver-ca` являются внутренними УЦ,
+> и использование собственного УЦ для них допустимо и в промышленной среде.
 
-## Кто кого проверяет
+## Выпуск сертификатов
 
-- **webserver проверяет proxy.** proxy предъявляет `proxy-client.crt`, webserver проверяет, что он подписан
-  `client-ca.crt`. Нет сертификата или он чужой — `400 Bad Request`.
-- **proxy проверяет webserver.** webserver предъявляет `webserver.crt`, proxy сверяет его с той же копией
-  `webserver.crt`, которой доверяет. Сертификат подменён — `502 Bad Gateway`.
-- **curl проверяет proxy** по `proxy.crt` (`--cacert`).
+Требуется **OpenSSL 3.x**: LibreSSL не поддерживает параметры `-CA`/`-CAkey` команды `openssl req`. Команды
+выполняются в корне репозитория. Закрытые ключи не зашифрованы (`-nodes`), поэтому файлы `*.crt` и `*.key`
+исключены из репозитория через [.gitignore](.gitignore).
 
-## Создание сертификатов
-
-Сертификаты в репозиторий не входят, их нужно сгенерировать самостоятельно. Все команды выполняются в корне
-репозитория, имена файлов совпадают с теми, что монтируются в [docker-compose.yml](docker-compose.yml).
-
-Используется **OpenSSL 3.x** (`openssl version`). LibreSSL не подойдёт: он не поддерживает опции `-CA`/`-CAkey`
-у `openssl req`.
-
-Каждая команда создаёт ключ и сертификат сразу, без CSR и без файлов конфигурации.
-
-**1. CA для клиентской аутентификации.** Им подписываются клиентские сертификаты, ему доверяет webserver.
+CA и клиентский сертификат proxy для mTLS-аутентификации на webserver:
 
 ```console
-openssl req -x509 -newkey rsa:4096 -nodes -keyout client-ca.key -out client-ca.crt -days 3650 -subj "/CN=Demo mTLS CA"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout mtls-ca.key -out mtls-ca.crt -days 3650 -subj "/CN=Demo mTLS CA"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout mtls-proxy.key -out mtls-proxy.crt -days 365 -subj "/CN=mtls-proxy" -CA mtls-ca.crt -CAkey mtls-ca.key
 ```
 
-**2. Клиентский сертификат для proxy**, подписанный этим CA.
+CA и серверный сертификат webserver:
 
 ```console
-openssl req -x509 -newkey rsa:4096 -nodes -keyout proxy-client.key -out proxy-client.crt -days 365 -subj "/CN=proxy-client" -CA client-ca.crt -CAkey client-ca.key -addext "basicConstraints=critical,CA:FALSE"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout webserver-ca.key -out webserver-ca.crt -days 3650 -subj "/CN=Demo Webserver CA"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout webserver.key -out webserver.crt -days 365 -subj "/CN=webserver" -CA webserver-ca.crt -CAkey webserver-ca.key -addext "subjectAltName=DNS:webserver,DNS:localhost"
 ```
 
-`basicConstraints=critical,CA:FALSE` запрещает использовать сертификат как CA, то есть подписывать им другие
-сертификаты. Без него `openssl req -x509` по умолчанию пометит сертификат как CA. `critical` означает, что
-программа, которая не понимает это расширение, обязана отклонить сертификат, а не проигнорировать ограничение.
-
-**3. Серверный сертификат webserver** (самоподписанный).
+CA и серверный сертификат proxy:
 
 ```console
-openssl req -x509 -newkey rsa:4096 -nodes -keyout webserver.key -out webserver.crt -days 365 -subj "/CN=webserver" -addext "subjectAltName=DNS:webserver,DNS:localhost"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout proxy-ca.key -out proxy-ca.crt -days 3650 -subj "/CN=Demo Proxy CA"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout proxy.key -out proxy.crt -days 365 -subj "/CN=proxy" -CA proxy-ca.crt -CAkey proxy-ca.key -addext "subjectAltName=DNS:proxy,DNS:localhost"
 ```
 
-`subjectAltName` перечисляет имена хостов, для которых действует сертификат. Клиент сверяет с этим списком
-адрес, к которому подключился: proxy обращается к `webserver`, а curl в примерах ниже к `localhost`.
+Расширение `subjectAltName` задаёт имена хостов, для которых действителен серверный сертификат: proxy
+обращается к `webserver`, curl — к `localhost`.
 
-**4. Серверный сертификат proxy** (самоподписанный).
+Проверка цепочек доверия:
 
 ```console
-openssl req -x509 -newkey rsa:4096 -nodes -keyout proxy.key -out proxy.crt -days 365 -subj "/CN=proxy" -addext "subjectAltName=DNS:proxy,DNS:localhost"
+~$ openssl verify -CAfile mtls-ca.crt mtls-proxy.crt
+mtls-proxy.crt: OK
+~$ openssl verify -CAfile webserver-ca.crt webserver.crt
+webserver.crt: OK
+~$ openssl verify -CAfile proxy-ca.crt proxy.crt
+proxy.crt: OK
 ```
-
-`subjectAltName` здесь тот же по смыслу: curl подключается к proxy по адресу `localhost`.
-
-**Проверка.** Клиентский сертификат должен проходить проверку по CA:
-
-```console
-~$ openssl verify -CAfile client-ca.crt proxy-client.crt
-proxy-client.crt: OK
-~$ openssl x509 -in proxy-client.crt -noout -subject -issuer -enddate
-subject=CN=proxy-client
-issuer=CN=Demo mTLS CA
-notAfter=...
-```
-
-Закрытые ключи лежат незашифрованными (`-nodes`), поэтому коммитить их нельзя: `*.crt` и `*.key` уже
-указаны в [.gitignore](.gitignore).
 
 ## Запуск
 
 ```console
 docker compose up -d
-docker compose ps
 ```
 
-Поднимутся два контейнера:
+Сервис webserver доступен по адресу https://localhost:8443, proxy — по адресу https://localhost:9443.
 
-- `nginx_webserver` на https://localhost:8443, требует клиентский сертификат;
-- `nginx_proxy` на https://localhost:9443, проксирует запросы на webserver с клиентским сертификатом.
-
-Остановить:
+Остановка:
 
 ```console
 docker compose down
@@ -107,112 +87,98 @@ docker compose down
 
 ## Проверка
 
-Во всех примерах используется `--cacert`: curl проверяет серверный сертификат по нашему
-самоподписанному файлу.
+### Успешные сценарии
 
-### Как работает
-
-**Через proxy: доступ есть.** proxy сам предъявляет webserver'у клиентский сертификат.
+Запрос через proxy:
 
 ```console
-~$ curl --cacert proxy.crt https://localhost:9443/
+~$ curl --cacert proxy-ca.crt https://localhost:9443/
 <html>
     <h1>Test webserver</h1>
 </html>
 ```
 
-**Напрямую с клиентским сертификатом: доступ есть.** Пускает именно сертификат, а не proxy: curl с тем же
-сертификатом и ключом проходит так же.
+Прямой запрос к webserver с клиентским сертификатом. Доступ определяется сертификатом, а не источником
+запроса:
 
 ```console
-~$ curl --cacert webserver.crt --cert proxy-client.crt --key proxy-client.key https://localhost:8443/
+~$ curl --cacert webserver-ca.crt --cert mtls-proxy.crt --key mtls-proxy.key https://localhost:8443/
 <html>
     <h1>Test webserver</h1>
 </html>
 ```
 
-### Как не работает
-
-**Напрямую без сертификата: отказ.**
+Замена webserver экземпляром с другим сертификатом, выпущенным тем же CA. Конфигурация proxy не изменяется:
 
 ```console
-~$ curl --cacert webserver.crt https://localhost:8443/
+~$ openssl req -x509 -newkey rsa:4096 -nodes -keyout webserver2.key -out webserver2.crt -days 365 -subj "/CN=webserver2" -CA webserver-ca.crt -CAkey webserver-ca.key -addext "subjectAltName=DNS:webserver"
+~$ docker compose stop webserver
+~$ docker compose run -d --name webserver2 --use-aliases -v ./webserver2.crt:/etc/nginx/certs/webserver.crt:ro -v ./webserver2.key:/etc/nginx/certs/webserver.key:ro webserver
+~$ docker compose restart proxy
+~$ curl --cacert proxy-ca.crt https://localhost:9443/
 <html>
+    <h1>Test webserver</h1>
+</html>
+~$ docker rm -f webserver2 && rm webserver2.*
+~$ docker compose up -d && docker compose restart proxy
+```
+
+Перезапуск proxy необходим, поскольку nginx разрешает имя `webserver` в IP-адрес однократно при запуске.
+
+### Сценарии отказа
+
+Прямой запрос к webserver без клиентского сертификата:
+
+```console
+~$ curl --cacert webserver-ca.crt https://localhost:8443/
+...
 <head><title>400 No required SSL certificate was sent</title></head>
-<body>
-<center><h1>400 Bad Request</h1></center>
-<center>No required SSL certificate was sent</center>
-<hr><center>nginx/1.29.3</center>
-</body>
-</html>
+...
 ```
 
-**С сертификатом от чужого CA: отказ.** Сгенерируем самоподписанный сертификат, которому webserver не доверяет:
+Клиентский сертификат, выпущенный недоверенным CA (аналогичный ответ возвращается для сертификата с истёкшим
+сроком действия):
 
 ```console
 ~$ openssl req -x509 -newkey rsa:2048 -nodes -keyout fake.key -out fake.crt -days 1 -subj "/CN=fake"
-~$ curl --cacert webserver.crt --cert fake.crt --key fake.key https://localhost:8443/
-<html>
+~$ curl --cacert webserver-ca.crt --cert fake.crt --key fake.key https://localhost:8443/
+...
 <head><title>400 The SSL certificate error</title></head>
-<body>
-<center><h1>400 Bad Request</h1></center>
-<center>The SSL certificate error</center>
-<hr><center>nginx/1.29.3</center>
-</body>
-</html>
-~$ rm fake.key fake.crt
+...
+~$ rm fake.*
 ```
 
-Ответ `400 The SSL certificate error` придёт и тогда, когда у клиентского сертификата истёк срок действия.
-
-**Подменённый webserver: отказ на стороне proxy.** proxy проверяет сертификат webserver
-(`proxy_ssl_verify on`). Остановим настоящий webserver и запустим вместо него поддельный: тот же сервис под
-тем же сетевым именем `webserver`, но со своим сертификатом. Имя в сертификате совпадает, отличается только
-подпись.
+Подмена webserver: имя в сертификате совпадает, однако сертификат подписан не `webserver-ca`:
 
 ```console
 ~$ openssl req -x509 -newkey rsa:2048 -nodes -keyout evil.key -out evil.crt -days 1 -subj "/CN=evil" -addext "subjectAltName=DNS:webserver"
 ~$ docker compose stop webserver
 ~$ docker compose run -d --name fake_webserver --use-aliases -v ./evil.crt:/etc/nginx/certs/webserver.crt:ro -v ./evil.key:/etc/nginx/certs/webserver.key:ro webserver
 ~$ docker compose restart proxy
-```
-
-`restart proxy` нужен потому, что nginx определяет IP-адрес `webserver` один раз при старте. Без перезапуска
-proxy продолжит стучаться на старый адрес.
-
-proxy доверяет только настоящему сертификату webserver, поэтому обрывает соединение с подделкой и отвечает 502:
-
-```console
-~$ curl --cacert proxy.crt https://localhost:9443/
-<html>
+~$ curl --cacert proxy-ca.crt https://localhost:9443/
+...
 <head><title>502 Bad Gateway</title></head>
 ...
 ~$ docker compose logs proxy | grep upstream
 ... upstream SSL certificate verify error: (18:self-signed certificate) while SSL handshaking to upstream ...
-```
-
-Вернуть всё как было:
-
-```console
-~$ docker rm -f fake_webserver && rm evil.crt evil.key
+~$ docker rm -f fake_webserver && rm evil.*
 ~$ docker compose up -d && docker compose restart proxy
 ```
 
-**Без доверия к серверному сертификату: отказ на стороне клиента.** Это обычная проверка сервера, она есть и
-в простом TLS:
+Запрос к proxy без указания доверенного CA (или с указанием постороннего CA):
 
 ```console
 ~$ curl https://localhost:9443/
-curl: (60) SSL certificate problem: self signed certificate
+curl: (60) SSL certificate problem: unable to get local issuer certificate
 ```
 
-### Что сервер просит у клиента
+### Запрос клиентского сертификата
 
-`openssl s_client` показывает, сертификат какого CA webserver ожидает от клиента
-(сообщение CertificateRequest в рукопожатии):
+Сообщение CertificateRequest в рукопожатии содержит перечень CA, сертификаты которых webserver принимает от
+клиентов:
 
 ```console
-~$ openssl s_client -connect localhost:8443 -CAfile webserver.crt </dev/null 2>/dev/null | grep -A1 "Acceptable client"
+~$ openssl s_client -connect localhost:8443 -CAfile webserver-ca.crt </dev/null 2>/dev/null | grep -A1 "Acceptable client"
 Acceptable client certificate CA names
 CN=Demo mTLS CA
 ```
